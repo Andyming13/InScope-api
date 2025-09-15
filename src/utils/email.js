@@ -1,31 +1,48 @@
-const mode = (process.env.EMAIL_MODE || 'log').toLowerCase();
+// src/utils/email.js
+const MODE = (process.env.EMAIL_MODE || 'log').toLowerCase();
+const FROM = process.env.EMAIL_FROM || 'InScope <onboarding@resend.dev>';
+const RESEND_KEY = process.env.RESEND_API_KEY;
 
+async function sendViaResend({ to, subject, html }) {
+  if (!RESEND_KEY) throw new Error('RESEND_API_KEY missing');
+  // Node 18+ 自带 fetch
+  const res = await fetch('https://api.resend.com/emails', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${RESEND_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ from: FROM, to, subject, html })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data?.message || data?.error || `HTTP ${res.status}`;
+    throw new Error(`Resend error: ${msg}`);
+  }
+  return data;
+}
+
+// 发送验证码邮件
 async function sendVerifyEmail({ to, code }) {
-  if (mode === 'log') {
-    console.log(`[DEV MAIL] to=${to} code=${code}`); // 本地调试直接看日志
-    return;
+  const subject = 'Your InScope verification code';
+  const html = `
+    <div style="font-family:system-ui,Segoe UI,Arial,sans-serif">
+      <p>Hi there,</p>
+      <p>Your verification code is:</p>
+      <p style="font-size:28px;font-weight:700;letter-spacing:3px">${code}</p>
+      <p>This code expires in 10 minutes.</p>
+      <hr/>
+      <p>InScope – Bilingual Exchange @ USYD</p>
+    </div>
+  `;
+
+  if (MODE === 'resend') {
+    return sendViaResend({ to, subject, html });
   }
-  if (mode === 'resend') {
-    const { Resend } = require('resend');
-    const resend = new Resend(process.env.RESEND_API_KEY);
-    const from = process.env.EMAIL_FROM || 'InScope <onboarding@resend.dev>';
-    const subject = 'Your InScope verification code | InScope 验证码';
-    const html = `
-      <div style="font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial">
-        <p>Hi there,</p>
-        <p>Your verification code is:</p>
-        <div style="font-size:28px;font-weight:800;letter-spacing:4px">${code}</div>
-        <p>This code expires in <b>10 minutes</b>.</p>
-        <hr/>
-        <p>您好！</p>
-        <p>您的验证码为：</p>
-        <div style="font-size:28px;font-weight:800;letter-spacing:4px">${code}</div>
-        <p>该验证码 <b>10 分钟内有效</b>。</p>
-      </div>`;
-    await resend.emails.send({ from, to, subject, html });
-    return;
-  }
-  throw new Error(`Unsupported EMAIL_MODE=${mode}`);
+
+  // 默认 log 模式
+  console.log(`[DEV MAIL] to=${to} code=${code}`);
+  return { ok: true, dev: true };
 }
 
 module.exports = { sendVerifyEmail };
