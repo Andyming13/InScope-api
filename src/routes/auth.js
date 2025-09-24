@@ -11,6 +11,7 @@ const { signAccessToken, verifyToken } = require('../utils/jwt');
 const { sendMail } = require('../utils/email');
 
 const router = express.Router();
+
 const JWT_SECRET = process.env.JWT_SECRET;
 if (!JWT_SECRET) throw new Error('JWT_SECRET not set');
 
@@ -26,13 +27,13 @@ function setRefreshCookie(res, raw) {
   res.cookie('rt', raw, {
     httpOnly: true,
     sameSite: 'lax',
-    secure: isProd, // 线上必须 https
+    secure: isProd,
     path: '/',
-    maxAge: 30 * 24 * 60 * 60 * 1000, // 30天
+    maxAge: 30 * 24 * 60 * 60 * 1000,
   });
 }
 
-// 同IP限流
+// ===== 限流 =====
 const ipLimiter = rateLimit({
   windowMs: 60_000,
   max: 20,
@@ -70,7 +71,7 @@ router.post('/request-code', ipLimiter, async (req, res) => {
 
     const code = generate6DigitCode();
     const codeHash = await argon2.hash(code, { type: argon2.argon2id });
-    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10分钟
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
     await query(
       `insert into verification_codes (email, code_hash, purpose, expires_at, attempts_remaining)
@@ -78,7 +79,6 @@ router.post('/request-code', ipLimiter, async (req, res) => {
       [email, codeHash, purpose, expiresAt]
     );
 
-    // 发邮件（log 模式会在日志打印，resend 模式走 utils/email）
     const subject = purpose === 'verify_email' ? 'InScope 验证码 / Verification Code' : 'InScope 重置密码验证码';
     const text = `您的验证码是 ${code}（10分钟内有效）。If you did not request this, please ignore.`;
     const html = `<p>您的验证码是 <b style="font-size:18px">${code}</b>（10分钟内有效）。</p><p>If you did not request this, please ignore.</p>`;
@@ -127,10 +127,8 @@ router.post('/verify-code', ipLimiter, async (req, res) => {
       return res.status(400).json({ ok: false, code: 'CODE_INCORRECT', message: '验证码不正确。' });
     }
 
-    // 作废此验证码
     await query(`update verification_codes set attempts_remaining = 0 where id=$1`, [row.id]);
 
-    // 签发一次性 registration_token（15分钟）
     const registrationToken = jwt.sign(
       { type: 'registration', email },
       JWT_SECRET,
@@ -181,26 +179,42 @@ router.post('/register', ipLimiter, async (req, res) => {
     if (dupe.rows[0].email_taken) return res.status(409).json({ ok: false, code: 'EMAIL_TAKEN', message: '该邮箱已注册' });
     if (dupe.rows[0].username_taken) return res.status(409).json({ ok: false, code: 'USERNAME_TAKEN', message: '该用户名已被占用' });
 
+    // 写库（argon2id）—— ⚠️ 去掉 email_verified_at
     const passwordHash = await argon2.hash(password, { type: argon2.argon2id });
-    const created = await query(
-      `insert into users (email, email_verified_at, password_hash, username)
-       values ($1, now(), $2, $3)
-       returning id, email, username, created_at`,
-      [email, passwordHash, username]
-    );
-    const user = created.rows[0];
 
-    // 生成 Access Token
+    let user;
+    try {
+      const created = await query(
+        `insert into users (email, password_hash, username)
+         values ($1, $2, $3)
+         returning id, email, username, created_at`,
+        [email, passwordHash, username]
+      );
+      user = created.rows[0];
+    } catch (e) {
+      if (e && e.code === '23505') {
+        const c = (e.constraint || '').toLowerCase();
+        if (c.includes('email')) {
+          return res.status(409).json({ ok: false, code: 'EMAIL_TAKEN', message: '该邮箱已注册' });
+        }
+        if (c.includes('username')) {
+          return res.status(409).json({ ok: false, code: 'USERNAME_TAKEN', message: '该用户名已被占用' });
+        }
+        return res.status(409).json({ ok: false, code: 'UNIQUE_CONFLICT', message: '信息已被占用' });
+      }
+      console.error('REGISTER_INSERT_ERROR', e);
+      return res.status(500).json({ ok: false, code: 'SERVER_ERROR' });
+    }
+
     const accessToken = signAccessToken({ sub: user.id, email: user.email, username: user.username });
 
-    // 生成 Refresh Token（入库哈希 & 写 HttpOnly Cookie）
     const rawRt = crypto.randomBytes(32).toString('hex');
     const rtHash = sha256(rawRt);
     const ua = req.headers['user-agent'] || '';
     const ip = (req.ip || '').toString();
     const ipHash = sha256(ip);
+    const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000);
 
-    const expiresAt = new Date(Date.now() + 30 * 24 * 3600 * 1000); // 30天
     await query(
       `insert into refresh_tokens (user_id, token_hash, user_agent, ip_hash, expires_at)
        values ($1,$2,$3,$4,$5)`,
@@ -311,7 +325,6 @@ router.post('/refresh', ipLimiter, async (req, res) => {
     }
     const user = u.rows[0];
 
-    // 旋转 refresh token：生成新 token，入库并删除旧 token
     const newRt = crypto.randomBytes(32).toString('hex');
     const newRtHash = sha256(newRt);
     const ua = req.headers['user-agent'] || '';
