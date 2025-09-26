@@ -1,131 +1,59 @@
-// src/routes/courses.js
-const express = require('express');
-const rateLimit = require('express-rate-limit');
-const { query } = require('../db');
-const { verifyToken } = require('../utils/jwt');
+import { Router } from 'express';
+import { query } from '../db.js';
+import { isEmail } from '../utils/validate.js';
 
-const router = express.Router();
+const router = Router();
 
-// 基础限流
-const ipLimiter = rateLimit({
-  windowMs: 60_000,
-  max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
-// 统一封装：从 Authorization 里解析用户
-async function getUserFromAuth(req, res) {
-  const h = req.headers.authorization || '';
-  const m = h.match(/^Bearer\s+(.+)$/i);
-  if (!m) {
-    res.status(401).json({ ok: false, code: 'NO_ACCESS_TOKEN', message: '请先登录后再报名。' });
-    return null;
-  }
-  let claims;
+/**
+ * GET /api/v1/courses
+ */
+router.get('/courses', async (_req, res) => {
   try {
-    claims = verifyToken(m[1]);
+    const { rows } = await query(
+      'SELECT id, title, event_date, time_text, location_text, max_member FROM courses ORDER BY event_date ASC;'
+    );
+    return res.json({ ok: true, data: rows });
   } catch (e) {
-    res.status(401).json({ ok: false, code: 'BAD_ACCESS_TOKEN', message: '登录已失效，请重新登录。' });
-    return null;
-  }
-  if (!claims?.sub) {
-    res.status(401).json({ ok: false, code: 'BAD_ACCESS_TOKEN', message: '登录已失效，请重新登录。' });
-    return null;
-  }
-  return { userId: claims.sub, email: claims.email, username: claims.username };
-}
-
-// GET /api/v1/courses  列表
-router.get('/', ipLimiter, async (_req, res) => {
-  try {
-    const { rows } = await query(
-      `select id::text, title, description, start_time, end_time
-         from courses
-        order by start_time asc`
-    );
-    res.json({ ok: true, data: rows });
-  } catch (err) {
-    console.error('COURSES_LIST_ERROR', err);
-    res.status(500).json({ ok: false, code: 'SERVER_ERROR' });
+    console.error(e);
+    return res.status(500).json({ ok: false, code: 'DB_ERROR' });
   }
 });
 
-// POST /api/v1/courses/:id/enroll  报名
-router.post('/:id/enroll', ipLimiter, async (req, res) => {
+/**
+ * POST /api/v1/courses/:id/enroll
+ * body: { username, email }
+ */
+router.post('/courses/:id/enroll', async (req, res) => {
+  const courseId = req.params.id;
+  const { username, email } = req.body || {};
+  if (!username || !email) {
+    return res.status(400).json({ ok: false, code: 'BAD_REQUEST' });
+  }
+  if (!isEmail(email)) {
+    return res.status(400).json({ ok: false, code: 'INVALID_EMAIL' });
+  }
   try {
-    const auth = await getUserFromAuth(req, res);
-    if (!auth) return;
-    const userId = auth.userId;
-    const courseId = Number(req.params.id);
-
-    if (!Number.isFinite(courseId) || courseId <= 0) {
-      return res.status(400).json({ ok: false, code: 'BAD_COURSE_ID', message: '课程 ID 不合法。' });
-    }
-
-    // 查课程是否存在
-    const course = await query(`select id from courses where id = $1`, [courseId]);
-    if (!course.rows.length) {
-      return res.status(404).json({ ok: false, code: 'COURSE_NOT_FOUND', message: '课程不存在。' });
-    }
-
-    // 已报过名？
-    const existed = await query(
-      `select 1 from enrollments where user_id = $1 and course_id = $2 limit 1`,
-      [userId, courseId]
+    const u = await query(
+      `INSERT INTO users (username, email)
+       VALUES ($1, $2)
+       ON CONFLICT (email) DO UPDATE SET username = EXCLUDED.username
+       RETURNING id;`,
+      [username, email]
     );
-    if (existed.rows.length) {
-      return res.status(409).json({ ok: false, code: 'ALREADY_ENROLLED', message: '你已报名该课程。' });
-    }
+    const userId = u.rows[0].id;
 
-    // 容量限制：30 人
-    const cap = 30;
-    const cnt = await query(
-      `select count(*)::int as c from enrollments where course_id = $1`,
-      [courseId]
-    );
-    if (cnt.rows[0].c >= cap) {
-      return res.status(409).json({ ok: false, code: 'COURSE_FULL', message: '该课程报名已满。' });
-    }
-
-    // 入库
     await query(
-      `insert into enrollments (user_id, course_id) values ($1, $2)`,
+      `INSERT INTO enrollments (user_id, course_id)
+       VALUES ($1, $2)
+       ON CONFLICT (user_id, course_id) DO NOTHING;`,
       [userId, courseId]
     );
 
-    console.log('[ENROLL] ok', { userId, courseId });
     return res.json({ ok: true });
-  } catch (err) {
-    // 如果是唯一约束触发（user_id, course_id）
-    if (String(err?.code) === '23505') {
-      return res.status(409).json({ ok: false, code: 'ALREADY_ENROLLED', message: '你已报名该课程。' });
-    }
-    console.error('ENROLL_ERROR', err);
-    res.status(500).json({ ok: false, code: 'SERVER_ERROR', message: '报名失败，请稍后再试。' });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ ok: false, code: 'DB_ERROR' });
   }
 });
 
-// GET /api/v1/courses/mine  我报名的课程
-router.get('/mine', ipLimiter, async (req, res) => {
-  try {
-    const auth = await getUserFromAuth(req, res);
-    if (!auth) return;
-    const userId = auth.userId;
-
-    const { rows } = await query(
-      `select c.id::text, c.title, c.start_time, c.end_time, e.created_at as enrolled_at
-         from enrollments e
-         join courses c on c.id = e.course_id
-        where e.user_id = $1
-        order by c.start_time asc`,
-      [userId]
-    );
-    res.json({ ok: true, data: rows });
-  } catch (err) {
-    console.error('MINE_COURSES_ERROR', err);
-    res.status(500).json({ ok: false, code: 'SERVER_ERROR' });
-  }
-});
-
-module.exports = router;
+export default router;
